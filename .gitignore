@@ -1,0 +1,21 @@
+# Build artifacts
+bin/
+dist/
+*.exe
+*.out
+
+# Go tooling
+coverage.out
+*.test
+
+# Local runtime/sensitive outputs
+keys/
+out/
+vault-data/
+
+# Environment and editor files
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/

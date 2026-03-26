@@ -1,0 +1,14 @@
+services:
+  vault:
+    image: hashicorp/vault:latest
+    container_name: vault
+    ports:
+      - "18300:18300"
+    cap_add:
+      - IPC_LOCK
+    environment:
+      - VAULT_ADDR=http://127.0.0.1:18300
+    volumes:
+      - ./vault-config:/vault/config:ro
+      - ./vault-data:/vault/data
+    command: ["server", "-config=/vault/config/config.hcl"]
