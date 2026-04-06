@@ -2,11 +2,12 @@ package vault
 
 import (
 	"bytes"
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,12 +17,16 @@ import (
 	"time"
 
 	"vault-operator/internal/config"
+	"vault-operator/internal/logger"
+
+	"github.com/google/uuid"
 )
 
 type Client struct {
-	addr    string
-	http    *http.Client
+	addr     string
+	http     *http.Client
 	tlsInsec bool
+	retry    config.RetryConfig
 }
 
 func New(cfg config.Config) (*Client, error) {
@@ -35,9 +40,10 @@ func New(cfg config.Config) (*Client, error) {
 	}
 
 	return &Client{
-		addr:    strings.TrimRight(cfg.VaultAddr, "/"),
-		http:    &http.Client{Timeout: time.Duration(cfg.ClientTimeoutS) * time.Second, Transport: transport},
+		addr:     strings.TrimRight(cfg.VaultAddr, "/"),
+		http:     &http.Client{Timeout: time.Duration(cfg.ClientTimeoutS) * time.Second, Transport: transport},
 		tlsInsec: cfg.TLSInsecure,
+		retry:    cfg.Retry,
 	}, nil
 }
 
@@ -73,6 +79,52 @@ func (c *Client) Ping(timeout time.Duration) error {
 }
 
 func (c *Client) doJSON(method, path string, token string, reqBody any, out any) error {
+	return c.doJSONWithRetry(context.Background(), method, path, reqBody, out, token)
+}
+
+// RequestJSON is used by subpackages (auth/policy/audit) for Vault API calls.
+func (c *Client) RequestJSON(ctx context.Context, method, path, token string, reqBody, out any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.doJSONWithRetry(ctx, method, path, reqBody, out, token)
+}
+
+func (c *Client) doJSONWithRetry(ctx context.Context, method, path string, body, out any, token string) error {
+	maxAttempts := c.retry.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := c.backoffDelay(attempt)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return fmt.Errorf("vault request canceled: %w", ctx.Err())
+			}
+		}
+		rid := newRequestID()
+		err := c.doJSONOnce(ctx, method, path, token, rid, body, out)
+		if err == nil {
+			return nil
+		}
+		if !isRetryable(err) {
+			return err
+		}
+		logger.Log.Warn().
+			Str("component", "vault/client").
+			Str("request_id", rid).
+			Int("attempt", attempt+1).
+			Err(err).
+			Msg("retrying vault request")
+		lastErr = err
+	}
+	return fmt.Errorf("vault request failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func (c *Client) doJSONOnce(ctx context.Context, method, path string, token, requestID string, reqBody any, out any) error {
 	var bodyReader io.Reader
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)
@@ -82,7 +134,7 @@ func (c *Client) doJSON(method, path string, token string, reqBody any, out any)
 		bodyReader = bytes.NewReader(b)
 	}
 
-	req, err := http.NewRequest(method, c.addr+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, c.addr+path, bodyReader)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -92,7 +144,9 @@ func (c *Client) doJSON(method, path string, token string, reqBody any, out any)
 	if token != "" {
 		req.Header.Set("X-Vault-Token", token)
 	}
+	req.Header.Set("X-Request-ID", requestID)
 
+	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("request %s %s: %w", method, path, c.hintConnErr(err))
@@ -103,6 +157,14 @@ func (c *Client) doJSON(method, path string, token string, reqBody any, out any)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
+	logger.Log.Info().
+		Str("component", "vault/client").
+		Str("request_id", requestID).
+		Str("method", method).
+		Str("path", path).
+		Int("status_code", resp.StatusCode).
+		Int64("duration_ms", time.Since(start).Milliseconds()).
+		Msg("vault api call")
 
 	if resp.StatusCode >= 300 {
 		// Vault often returns a JSON error object; include raw body for debugging.
@@ -116,6 +178,46 @@ func (c *Client) doJSON(method, path string, token string, reqBody any, out any)
 		return fmt.Errorf("unmarshal response: %w (body=%s)", err, strings.TrimSpace(string(respBytes)))
 	}
 	return nil
+}
+
+func (c *Client) backoffDelay(attempt int) time.Duration {
+	base := c.retry.BaseDelay
+	if base <= 0 {
+		base = 100 * time.Millisecond
+	}
+	maxDelay := c.retry.MaxDelay
+	if maxDelay <= 0 {
+		maxDelay = 2 * time.Second
+	}
+	delay := base * time.Duration(1<<attempt)
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	jitterSpan := int64(delay / 5)
+	if jitterSpan <= 0 {
+		return delay
+	}
+	// +/-20% jitter.
+	jitter := rand.Int63n(jitterSpan*2) - jitterSpan
+	return delay + time.Duration(jitter)
+}
+
+func newRequestID() string {
+	return uuid.NewString()
+}
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "status=429") || strings.Contains(msg, "status=503") {
+		return true
+	}
+	if strings.Contains(msg, "connection refused") || strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "timeout") {
+		return true
+	}
+	return false
 }
 
 func (c *Client) hintConnErr(err error) error {
@@ -145,7 +247,3 @@ func (c *Client) hintConnErr(err error) error {
 
 // TLSInsecure is a convenience accessor for future CLI/UI work.
 func (c *Client) TLSInsecure() bool { return c.tlsInsec }
-
-// tlsConfig exists only to appease any future expansions.
-func (c *Client) tlsConfig() (*tls.Config, bool) { return nil, c.tlsInsec }
-

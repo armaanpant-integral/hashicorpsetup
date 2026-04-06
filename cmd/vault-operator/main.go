@@ -5,16 +5,22 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"vault-operator/internal/config"
+	"vault-operator/internal/logger"
 	"vault-operator/internal/vault"
+	"vault-operator/internal/vault/audit"
+	vaultauth "vault-operator/internal/vault/auth"
+	"vault-operator/internal/vault/policy"
 
 	"github.com/spf13/cobra"
 )
 
 func main() {
 	baseCfg := config.Load()
+	logger.Init(baseCfg.LogLevel)
 
 	var (
 		vaultAddr      = baseCfg.VaultAddr
@@ -240,7 +246,163 @@ func main() {
 	}
 	uiCmd.Flags().String("listen-addr", ":8080", "Local address for UI server")
 
-	rootCmd.AddCommand(initCmd, unsealCmd, sealCmd, uiCmd)
+	bootstrapCmd := &cobra.Command{
+		Use:   "bootstrap",
+		Short: "Idempotent setup: audit, policies, OIDC, AppRole.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			token, _ := cmd.Flags().GetString("token")
+			policyDir, _ := cmd.Flags().GetString("policy-dir")
+			auditLog, _ := cmd.Flags().GetString("audit-log")
+			discoveryURL, _ := cmd.Flags().GetString("oidc-discovery-url")
+			oidcClientID, _ := cmd.Flags().GetString("oidc-client-id")
+			oidcClientSecret, _ := cmd.Flags().GetString("oidc-client-secret")
+			redirectURIsRaw, _ := cmd.Flags().GetString("oidc-redirect-uris")
+			if token == "" {
+				token = os.Getenv("VAULT_TOKEN")
+			}
+			client, err := vault.New(config.Config{
+				VaultAddr:      vaultAddr,
+				TLSInsecure:    tlsInsecure,
+				TLSCACertPath:  baseCfg.TLSCACertPath,
+				ClientTimeoutS: clientTimeoutS,
+				Retry:          baseCfg.Retry,
+			})
+			if err != nil {
+				return err
+			}
+			if err := audit.EnableFile(client, token, "file", auditLog); err != nil {
+				return err
+			}
+			applied, err := policy.ApplyFromDir(client, token, policyDir)
+			if err != nil {
+				return err
+			}
+			roles := []vaultauth.OIDCRole{
+				{
+					Name:                "developer",
+					BoundAudiences:      []string{"vault"},
+					AllowedRedirectURIs: splitCSV(redirectURIsRaw),
+					UserClaim:           "email",
+					GroupsClaim:         "groups",
+					TokenPolicies:       []string{"developer"},
+					TokenTTL:            "1h",
+					TokenMaxTTL:         "8h",
+				},
+			}
+			if err := vaultauth.SetupOIDC(client, token, vaultauth.OIDCParams{
+				DiscoveryURL: discoveryURL,
+				ClientID:     oidcClientID,
+				ClientSecret: oidcClientSecret,
+				DefaultRole:  "developer",
+				Roles:        roles,
+			}); err != nil {
+				return err
+			}
+			if err := vaultauth.SetupAppRole(client, token, vaultauth.AppRoleParams{
+				RoleName:        baseCfg.AppRole.RoleName,
+				TokenPolicies:   baseCfg.AppRole.TokenPolicies,
+				SecretIDTTL:     baseCfg.AppRole.SecretIDTTL,
+				TokenTTL:        baseCfg.AppRole.TokenTTL,
+				TokenMaxTTL:     baseCfg.AppRole.TokenMaxTTL,
+				BindSecretID:    baseCfg.AppRole.BindSecretID,
+				SecretIDNumUses: baseCfg.AppRole.SecretIDNumUses,
+			}); err != nil {
+				return err
+			}
+			fmt.Printf("Bootstrap complete. Policies applied: %s\n", strings.Join(applied, ", "))
+			return nil
+		},
+	}
+	bootstrapCmd.Flags().String("token", "", "Admin token (or env VAULT_TOKEN)")
+	bootstrapCmd.Flags().String("policy-dir", "./vault-policies", "Directory containing *.hcl policy files")
+	bootstrapCmd.Flags().String("audit-log", "/vault/logs/audit.log", "Path for file audit backend")
+	bootstrapCmd.Flags().String("oidc-discovery-url", baseCfg.OIDC.DiscoveryURL, "OIDC discovery URL")
+	bootstrapCmd.Flags().String("oidc-client-id", baseCfg.OIDC.ClientID, "OIDC client ID")
+	bootstrapCmd.Flags().String("oidc-client-secret", baseCfg.OIDC.ClientSecret, "OIDC client secret")
+	bootstrapCmd.Flags().String("oidc-redirect-uris", strings.Join(baseCfg.OIDC.RedirectURIs, ","), "Comma-separated OIDC redirect URIs")
+
+	authCmd := &cobra.Command{Use: "auth", Short: "Configure auth methods"}
+	setupOIDCCmd := &cobra.Command{
+		Use:   "setup-oidc",
+		Short: "Enable/configure OIDC auth",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			token, _ := cmd.Flags().GetString("token")
+			discoveryURL, _ := cmd.Flags().GetString("oidc-discovery-url")
+			oidcClientID, _ := cmd.Flags().GetString("oidc-client-id")
+			oidcClientSecret, _ := cmd.Flags().GetString("oidc-client-secret")
+			redirectURIsRaw, _ := cmd.Flags().GetString("oidc-redirect-uris")
+			if token == "" {
+				token = os.Getenv("VAULT_TOKEN")
+			}
+			client, err := vault.New(config.Config{
+				VaultAddr:      vaultAddr,
+				TLSInsecure:    tlsInsecure,
+				TLSCACertPath:  baseCfg.TLSCACertPath,
+				ClientTimeoutS: clientTimeoutS,
+				Retry:          baseCfg.Retry,
+			})
+			if err != nil {
+				return err
+			}
+			return vaultauth.SetupOIDC(client, token, vaultauth.OIDCParams{
+				DiscoveryURL: discoveryURL,
+				ClientID:     oidcClientID,
+				ClientSecret: oidcClientSecret,
+				DefaultRole:  "developer",
+				Roles: []vaultauth.OIDCRole{
+					{
+						Name:                "developer",
+						BoundAudiences:      []string{"vault"},
+						AllowedRedirectURIs: splitCSV(redirectURIsRaw),
+						UserClaim:           "email",
+						GroupsClaim:         "groups",
+						TokenPolicies:       []string{"developer"},
+						TokenTTL:            "1h",
+						TokenMaxTTL:         "8h",
+					},
+				},
+			})
+		},
+	}
+	setupOIDCCmd.Flags().String("token", "", "Admin token (or env VAULT_TOKEN)")
+	setupOIDCCmd.Flags().String("oidc-discovery-url", baseCfg.OIDC.DiscoveryURL, "OIDC discovery URL")
+	setupOIDCCmd.Flags().String("oidc-client-id", baseCfg.OIDC.ClientID, "OIDC client ID")
+	setupOIDCCmd.Flags().String("oidc-client-secret", baseCfg.OIDC.ClientSecret, "OIDC client secret")
+	setupOIDCCmd.Flags().String("oidc-redirect-uris", strings.Join(baseCfg.OIDC.RedirectURIs, ","), "Comma-separated OIDC redirect URIs")
+
+	setupAppRoleCmd := &cobra.Command{
+		Use:   "setup-approle",
+		Short: "Enable/configure AppRole auth",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			token, _ := cmd.Flags().GetString("token")
+			if token == "" {
+				token = os.Getenv("VAULT_TOKEN")
+			}
+			client, err := vault.New(config.Config{
+				VaultAddr:      vaultAddr,
+				TLSInsecure:    tlsInsecure,
+				TLSCACertPath:  baseCfg.TLSCACertPath,
+				ClientTimeoutS: clientTimeoutS,
+				Retry:          baseCfg.Retry,
+			})
+			if err != nil {
+				return err
+			}
+			return vaultauth.SetupAppRole(client, token, vaultauth.AppRoleParams{
+				RoleName:        baseCfg.AppRole.RoleName,
+				TokenPolicies:   baseCfg.AppRole.TokenPolicies,
+				SecretIDTTL:     baseCfg.AppRole.SecretIDTTL,
+				TokenTTL:        baseCfg.AppRole.TokenTTL,
+				TokenMaxTTL:     baseCfg.AppRole.TokenMaxTTL,
+				BindSecretID:    baseCfg.AppRole.BindSecretID,
+				SecretIDNumUses: baseCfg.AppRole.SecretIDNumUses,
+			})
+		},
+	}
+	setupAppRoleCmd.Flags().String("token", "", "Admin token (or env VAULT_TOKEN)")
+	authCmd.AddCommand(setupOIDCCmd, setupAppRoleCmd)
+
+	rootCmd.AddCommand(initCmd, unsealCmd, sealCmd, uiCmd, bootstrapCmd, authCmd)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -250,6 +412,21 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func splitCSV(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	items := strings.Split(v, ",")
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		it = strings.TrimSpace(it)
+		if it != "" {
+			out = append(out, it)
+		}
+	}
+	return out
 }
 
 const uiHTML = `<!doctype html>

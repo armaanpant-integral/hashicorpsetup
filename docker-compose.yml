@@ -7,8 +7,19 @@ services:
     cap_add:
       - IPC_LOCK
     environment:
-      - VAULT_ADDR=http://127.0.0.1:18300
+      - VAULT_ADDR=https://127.0.0.1:18300
+      - VAULT_SEAL_TYPE=${VAULT_SEAL_TYPE:-awskms}
+      - AWS_KMS_KEY_ID=${AWS_KMS_KEY_ID:-alias/vault-unseal}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ROLE_ARN=${AWS_ROLE_ARN:-}
     volumes:
       - ./vault-config:/vault/config:ro
       - ./vault-data:/vault/data
+      - ./tls:/vault/tls:ro
+      - ./vault-logs:/vault/logs
     command: ["server", "-config=/vault/config/config.hcl"]
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=https://127.0.0.1:18300", "-tls-skip-verify"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
